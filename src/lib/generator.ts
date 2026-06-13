@@ -15,6 +15,10 @@ import {
   type AuthContext,
 } from './sensitive'
 
+// Placeholder secret: long enough to avoid PyJWT's short-key warning in dev,
+// but obviously a placeholder so the production guard still trips.
+const DEFAULT_SECRET = 'change-me-please-use-openssl-rand-hex-32'
+
 interface PreparedTable {
   table: Table
   cls: string // model class name
@@ -174,7 +178,7 @@ function envExample(opts: GenOptions, authCtx: AuthContext | null): string {
     lines.push('')
     lines.push('# Auth — generate a strong key, e.g. `openssl rand -hex 32`.')
     lines.push('# The app refuses to start in production while this is the default.')
-    lines.push('SECRET_KEY=change-me-in-production')
+    lines.push(`SECRET_KEY=${DEFAULT_SECRET}`)
     lines.push('ACCESS_TOKEN_EXPIRE_MINUTES=30')
   }
   lines.push('')
@@ -730,8 +734,8 @@ ${sessionImport}
 from .database import get_db
 from .models import ${userCls}
 
-SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
-if SECRET_KEY == "change-me-in-production" and os.getenv("ENVIRONMENT", "").lower() in {
+SECRET_KEY = os.getenv("SECRET_KEY", "${DEFAULT_SECRET}")
+if SECRET_KEY == "${DEFAULT_SECRET}" and os.getenv("ENVIRONMENT", "").lower() in {
     "prod",
     "production",
 }:
