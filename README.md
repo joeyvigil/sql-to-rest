@@ -7,6 +7,8 @@ per-table CRUD routers — downloadable as a `.zip`.
 
 **🔗 Live demo: https://joeyvigil.github.io/sql-to-rest/**
 
+![sql-to-rest screenshot](docs/screenshot.png)
+
 ## Features
 
 - Pragmatic `CREATE TABLE` parser (MySQL / PostgreSQL / SQLite dialects)
