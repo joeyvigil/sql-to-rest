@@ -1,4 +1,12 @@
-export const SAMPLE_SQL = `CREATE TABLE authors (
+export const SAMPLE_SQL = `CREATE TABLE users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    email         VARCHAR(255) UNIQUE NOT NULL,
+    username      VARCHAR(80) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE authors (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        VARCHAR(120) NOT NULL,
     email       VARCHAR(255) UNIQUE NOT NULL,

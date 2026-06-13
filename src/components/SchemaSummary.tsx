@@ -1,4 +1,5 @@
 import type { Schema } from '../types'
+import { isSensitiveField } from '../lib/sensitive'
 
 interface Props {
   schema: Schema
@@ -21,6 +22,11 @@ export function SchemaSummary({ schema }: Props) {
                   {c.foreignKey && (
                     <span className="badge fk">
                       → {c.foreignKey.table}.{c.foreignKey.column}
+                    </span>
+                  )}
+                  {isSensitiveField(c.name) && (
+                    <span className="badge hidden" title="Excluded from API responses">
+                      HIDDEN
                     </span>
                   )}
                   {c.unique && !c.primaryKey && (

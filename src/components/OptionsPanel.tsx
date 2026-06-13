@@ -63,6 +63,17 @@ export function OptionsPanel({ options, onChange }: Props) {
           checked={options.tests}
           onChange={(v) => onChange({ ...options, tests: v })}
         />
+        <Toggle
+          label="Hash pw"
+          checked={options.hashPasswords || options.auth}
+          disabled={options.auth}
+          onChange={(v) => onChange({ ...options, hashPasswords: v })}
+        />
+        <Toggle
+          label="Auth (JWT)"
+          checked={options.auth}
+          onChange={(v) => onChange({ ...options, auth: v })}
+        />
       </div>
     </div>
   )
@@ -71,17 +82,20 @@ export function OptionsPanel({ options, onChange }: Props) {
 function Toggle({
   label,
   checked,
+  disabled,
   onChange,
 }: {
   label: string
   checked: boolean
+  disabled?: boolean
   onChange: (v: boolean) => void
 }) {
   return (
-    <label className={checked ? 'toggle on' : 'toggle'}>
+    <label className={`toggle${checked ? ' on' : ''}${disabled ? ' disabled' : ''}`}>
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(e) => onChange(e.target.checked)}
       />
       <span className="toggle-dot" />

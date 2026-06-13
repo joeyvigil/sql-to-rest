@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import './App.css'
 import { parseSql } from './lib/sqlParser'
 import { generateProject } from './lib/generator'
+import { detectAuthTable } from './lib/sensitive'
 import { SAMPLE_SQL } from './lib/sample'
 import { copyToClipboard, downloadZip } from './lib/download'
 import { DEFAULT_OPTIONS, type GenOptions, type GeneratedFile } from './types'
@@ -86,6 +87,15 @@ export default function App() {
           </div>
           <SqlEditor value={sql} onChange={setSql} />
           {error && <div className="banner error">Parser error: {error}</div>}
+          {options.auth &&
+            schema.tables.length > 0 &&
+            detectAuthTable(schema) === null && (
+              <div className="banner warn">
+                ⚠ Auth is enabled but no users table was found. Add a table with a
+                password column plus an <code>email</code> or <code>username</code>{' '}
+                column to generate login + protected routes.
+              </div>
+            )}
           {warnings.map((w, i) => (
             <div className="banner warn" key={i}>
               ⚠ {w}

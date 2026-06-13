@@ -8,6 +8,12 @@ import type {
 } from '../types'
 import { DEFAULT_OPTIONS } from '../types'
 import { className, pluralize, singularVar, snake } from './naming'
+import {
+  detectAuthTable,
+  isPasswordField,
+  isSensitiveField,
+  type AuthContext,
+} from './sensitive'
 
 interface PreparedTable {
   table: Table
@@ -35,16 +41,28 @@ export function generateProject(
     }
   })
 
+  // Auth context: only active when requested AND a suitable users table exists.
+  const authCtx = options.auth ? detectAuthTable(schema) : null
+  // Hashing is on when explicitly requested, or implicitly required by auth.
+  const hashing = options.hashPasswords || authCtx !== null
+  const authModule = authCtx ? snake(authCtx.table) : null
+
   const files: GeneratedFile[] = []
 
-  files.push({ path: 'requirements.txt', content: requirements(options), language: 'text' })
-  files.push({ path: '.env.example', content: envExample(options), language: 'text' })
+  files.push({ path: 'requirements.txt', content: requirements(options, hashing, authCtx), language: 'text' })
+  files.push({ path: '.env.example', content: envExample(options, authCtx), language: 'text' })
   files.push({ path: 'app/__init__.py', content: '', language: 'python' })
   files.push({ path: 'app/database.py', content: databasePy(options), language: 'python' })
   files.push({ path: 'app/models.py', content: modelsPy(prepared), language: 'python' })
   files.push({ path: 'app/schemas.py', content: schemasPy(prepared), language: 'python' })
   if (options.pagination) {
     files.push({ path: 'app/pagination.py', content: paginationPy(), language: 'python' })
+  }
+  if (hashing) {
+    files.push({ path: 'app/security.py', content: securityPy(), language: 'python' })
+  }
+  if (authCtx) {
+    files.push({ path: 'app/auth.py', content: authPy(authCtx, options), language: 'python' })
   }
   files.push({
     path: 'app/routers/__init__.py',
@@ -54,11 +72,18 @@ export function generateProject(
   for (const pt of prepared) {
     files.push({
       path: `app/routers/${pt.module}.py`,
-      content: routerPy(pt, options),
+      content: routerPy(pt, options, hashing, authCtx),
       language: 'python',
     })
   }
-  files.push({ path: 'app/main.py', content: mainPy(prepared, options), language: 'python' })
+  if (authCtx) {
+    files.push({
+      path: 'app/routers/auth.py',
+      content: authRouterPy(authCtx, options),
+      language: 'python',
+    })
+  }
+  files.push({ path: 'app/main.py', content: mainPy(prepared, options, authModule), language: 'python' })
 
   if (options.docker) {
     files.push({ path: 'Dockerfile', content: dockerfile(), language: 'text' })
@@ -74,7 +99,7 @@ export function generateProject(
     files.push({ path: 'tests/conftest.py', content: conftestPy(options), language: 'python' })
     files.push({
       path: 'tests/test_api.py',
-      content: testApiPy(prepared, options),
+      content: testApiPy(prepared, options, authCtx !== null),
       language: 'python',
     })
   }
@@ -117,7 +142,7 @@ function dbConfig(opts: GenOptions): { driver: string | null; url: string } {
   return { driver, url }
 }
 
-function requirements(opts: GenOptions): string {
+function requirements(opts: GenOptions, hashing: boolean, authCtx: AuthContext | null): string {
   const lines = [
     'fastapi>=0.110',
     'uvicorn[standard]>=0.29',
@@ -128,6 +153,11 @@ function requirements(opts: GenOptions): string {
   ]
   const { driver } = dbConfig(opts)
   if (driver) lines.push(driver)
+  if (hashing) lines.push('pwdlib[bcrypt]>=0.2')
+  if (authCtx) {
+    lines.push('pyjwt>=2.8')
+    lines.push('python-multipart>=0.0.9') // OAuth2PasswordRequestForm
+  }
   if (opts.tests) {
     // The generated tests run against a throwaway SQLite database.
     lines.push('pytest>=8.0')
@@ -138,9 +168,21 @@ function requirements(opts: GenOptions): string {
   return lines.join('\n')
 }
 
-function envExample(opts: GenOptions): string {
-  const { url } = dbConfig(opts)
-  return [`# Override the default ${opts.db} connection here.`, `DATABASE_URL=${url}`, ''].join('\n')
+function envExample(opts: GenOptions, authCtx: AuthContext | null): string {
+  const lines = [`# Override the default ${opts.db} connection here.`, `DATABASE_URL=${url(opts)}`]
+  if (authCtx) {
+    lines.push('')
+    lines.push('# Auth — generate a strong key, e.g. `openssl rand -hex 32`.')
+    lines.push('# The app refuses to start in production while this is the default.')
+    lines.push('SECRET_KEY=change-me-in-production')
+    lines.push('ACCESS_TOKEN_EXPIRE_MINUTES=30')
+  }
+  lines.push('')
+  return lines.join('\n')
+}
+
+function url(opts: GenOptions): string {
+  return dbConfig(opts).url
 }
 
 function databasePy(opts: GenOptions): string {
@@ -370,7 +412,11 @@ function schemasPy(prepared: PreparedTable[]): string {
       .filter((c) => !(c.primaryKey && c.autoIncrement))
       .map((c) => `    ${schemaField(c, true)}`)
 
-    const readLines = cols.map((c) => `    ${schemaField(c, c.nullable)}`)
+    // Sensitive columns (passwords, tokens, secrets) are never returned.
+    const readCols = cols.filter((c) => !isSensitiveField(c.name))
+    const readLines = readCols.length
+      ? readCols.map((c) => `    ${schemaField(c, c.nullable)}`)
+      : ['    pass']
 
     return `class ${pt.cls}Base(BaseModel):
 ${createLines.join('\n')}
@@ -422,143 +468,127 @@ function collectPyTypeImports(pyType: string, into: Set<string>): void {
 // routers/<table>.py
 // ---------------------------------------------------------------------------
 
-function routerPy(pt: PreparedTable, opts: GenOptions): string {
+function routerPy(
+  pt: PreparedTable,
+  opts: GenOptions,
+  hashing: boolean,
+  authCtx: AuthContext | null,
+): string {
   const pk = pt.pk
   const pkName = pk ? pk.name : 'id'
   const pkType = pk ? pk.pyType : 'int'
   const cls = pt.cls
   const v = pt.varName
 
+  const sess = opts.async ? 'AsyncSession' : 'Session'
+  const aw = opts.async ? 'await ' : ''
+  const adef = opts.async ? 'async def' : 'def'
+
+  const pwCols = hashing
+    ? pt.table.columns.filter((c) => isPasswordField(c.name)).map((c) => c.name)
+    : []
+
+  // Protect every endpoint when auth is on, except the users-table create,
+  // which stays open so the first account can be registered.
+  const protect = authCtx !== null
+  const isAuthTable = authCtx !== null && snake(authCtx.table) === pt.module
+  const dep = ', _user=Depends(get_current_user)'
+  const protAll = protect ? dep : ''
+  const protCreate = protect && !isAuthTable ? dep : ''
+
+  const sessionImport = opts.async
+    ? 'from sqlalchemy.ext.asyncio import AsyncSession'
+    : 'from sqlalchemy.orm import Session'
   const selectImport = opts.pagination
     ? 'from sqlalchemy import func, select'
     : 'from sqlalchemy import select'
   const pageImport = opts.pagination ? `\nfrom ..pagination import Page` : ''
+  const securityImport = pwCols.length ? '\nfrom ..security import hash_password' : ''
+  const authImport = protect ? '\nfrom ..auth import get_current_user' : ''
   const listModel = opts.pagination ? `Page[${cls}Read]` : `List[${cls}Read]`
   const typingBlock = opts.pagination ? '' : 'from typing import List\n\n'
 
-  if (opts.async) {
-    const listBody = opts.pagination
-      ? `    total = await db.scalar(select(func.count()).select_from(${cls}))
-    result = await db.scalars(select(${cls}).offset(skip).limit(limit))
-    return Page(items=list(result.all()), total=total or 0, skip=skip, limit=limit)`
-      : `    result = await db.scalars(select(${cls}).offset(skip).limit(limit))
-    return result.all()`
-    return `"""CRUD endpoints for ${pt.table.name}."""
-${typingBlock}from fastapi import APIRouter, Depends, HTTPException, status
-${selectImport}
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from ..database import get_db
-from ..models import ${cls}
-from ..schemas import ${cls}Create, ${cls}Read, ${cls}Update${pageImport}
-
-router = APIRouter(prefix="/${pt.routePrefix}", tags=["${pt.routePrefix}"])
-
-
-@router.get("", response_model=${listModel})
-async def list_${pt.routePrefix}(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
-${listBody}
-
-
-@router.get("/{${pkName}}", response_model=${cls}Read)
-async def get_${v}(${pkName}: ${pkType}, db: AsyncSession = Depends(get_db)):
-    obj = await db.get(${cls}, ${pkName})
-    if obj is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
-    return obj
-
-
-@router.post("", response_model=${cls}Read, status_code=status.HTTP_201_CREATED)
-async def create_${v}(payload: ${cls}Create, db: AsyncSession = Depends(get_db)):
-    obj = ${cls}(**payload.model_dump(exclude_unset=True))
-    db.add(obj)
-    await db.commit()
-    await db.refresh(obj)
-    return obj
-
-
-@router.put("/{${pkName}}", response_model=${cls}Read)
-async def update_${v}(${pkName}: ${pkType}, payload: ${cls}Update, db: AsyncSession = Depends(get_db)):
-    obj = await db.get(${cls}, ${pkName})
-    if obj is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(obj, field, value)
-    await db.commit()
-    await db.refresh(obj)
-    return obj
-
-
-@router.delete("/{${pkName}}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_${v}(${pkName}: ${pkType}, db: AsyncSession = Depends(get_db)):
-    obj = await db.get(${cls}, ${pkName})
-    if obj is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
-    await db.delete(obj)
-    await db.commit()
-    return None
-`
-  }
-
   const listBody = opts.pagination
-    ? `    total = db.scalar(select(func.count()).select_from(${cls}))
-    items = db.scalars(select(${cls}).offset(skip).limit(limit)).all()
-    return Page(items=list(items), total=total or 0, skip=skip, limit=limit)`
-    : `    return db.scalars(select(${cls}).offset(skip).limit(limit)).all()`
+    ? `    total = ${aw}db.scalar(select(func.count()).select_from(${cls}))
+    result = ${aw}db.scalars(select(${cls}).offset(skip).limit(limit))
+    return Page(items=list(result.all()), total=total or 0, skip=skip, limit=limit)`
+    : `    result = ${aw}db.scalars(select(${cls}).offset(skip).limit(limit))
+    return result.all()`
+
+  const hashSnippet = pwCols
+    .map((c) => `    if "${c}" in data:\n        data["${c}"] = hash_password(data["${c}"])`)
+    .join('\n')
+
+  const createBody = pwCols.length
+    ? `    data = payload.model_dump(exclude_unset=True)
+${hashSnippet}
+    obj = ${cls}(**data)
+    db.add(obj)
+    ${aw}db.commit()
+    ${aw}db.refresh(obj)
+    return obj`
+    : `    obj = ${cls}(**payload.model_dump(exclude_unset=True))
+    db.add(obj)
+    ${aw}db.commit()
+    ${aw}db.refresh(obj)
+    return obj`
+
+  const updateAssign = pwCols.length
+    ? `    data = payload.model_dump(exclude_unset=True)
+${hashSnippet}
+    for field, value in data.items():
+        setattr(obj, field, value)`
+    : `    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(obj, field, value)`
 
   return `"""CRUD endpoints for ${pt.table.name}."""
 ${typingBlock}from fastapi import APIRouter, Depends, HTTPException, status
 ${selectImport}
-from sqlalchemy.orm import Session
+${sessionImport}
 
 from ..database import get_db
 from ..models import ${cls}
-from ..schemas import ${cls}Create, ${cls}Read, ${cls}Update${pageImport}
+from ..schemas import ${cls}Create, ${cls}Read, ${cls}Update${pageImport}${securityImport}${authImport}
 
 router = APIRouter(prefix="/${pt.routePrefix}", tags=["${pt.routePrefix}"])
 
 
 @router.get("", response_model=${listModel})
-def list_${pt.routePrefix}(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+${adef} list_${pt.routePrefix}(skip: int = 0, limit: int = 100, db: ${sess} = Depends(get_db)${protAll}):
 ${listBody}
 
 
 @router.get("/{${pkName}}", response_model=${cls}Read)
-def get_${v}(${pkName}: ${pkType}, db: Session = Depends(get_db)):
-    obj = db.get(${cls}, ${pkName})
+${adef} get_${v}(${pkName}: ${pkType}, db: ${sess} = Depends(get_db)${protAll}):
+    obj = ${aw}db.get(${cls}, ${pkName})
     if obj is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
     return obj
 
 
 @router.post("", response_model=${cls}Read, status_code=status.HTTP_201_CREATED)
-def create_${v}(payload: ${cls}Create, db: Session = Depends(get_db)):
-    obj = ${cls}(**payload.model_dump(exclude_unset=True))
-    db.add(obj)
-    db.commit()
-    db.refresh(obj)
-    return obj
+${adef} create_${v}(payload: ${cls}Create, db: ${sess} = Depends(get_db)${protCreate}):
+${createBody}
 
 
 @router.put("/{${pkName}}", response_model=${cls}Read)
-def update_${v}(${pkName}: ${pkType}, payload: ${cls}Update, db: Session = Depends(get_db)):
-    obj = db.get(${cls}, ${pkName})
+${adef} update_${v}(${pkName}: ${pkType}, payload: ${cls}Update, db: ${sess} = Depends(get_db)${protAll}):
+    obj = ${aw}db.get(${cls}, ${pkName})
     if obj is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
-        setattr(obj, field, value)
-    db.commit()
-    db.refresh(obj)
+${updateAssign}
+    ${aw}db.commit()
+    ${aw}db.refresh(obj)
     return obj
 
 
 @router.delete("/{${pkName}}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_${v}(${pkName}: ${pkType}, db: Session = Depends(get_db)):
-    obj = db.get(${cls}, ${pkName})
+${adef} delete_${v}(${pkName}: ${pkType}, db: ${sess} = Depends(get_db)${protAll}):
+    obj = ${aw}db.get(${cls}, ${pkName})
     if obj is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
-    db.delete(obj)
-    db.commit()
+    ${aw}db.delete(obj)
+    ${aw}db.commit()
     return None
 `
 }
@@ -567,13 +597,19 @@ def delete_${v}(${pkName}: ${pkType}, db: Session = Depends(get_db)):
 // main.py
 // ---------------------------------------------------------------------------
 
-function mainPy(prepared: PreparedTable[], opts: GenOptions): string {
-  const imports = prepared
-    .map((pt) => `from .routers import ${pt.module}`)
-    .join('\n')
-  const includes = prepared
-    .map((pt) => `app.include_router(${pt.module}.router)`)
-    .join('\n')
+function mainPy(
+  prepared: PreparedTable[],
+  opts: GenOptions,
+  authModule: string | null,
+): string {
+  const routerModules = prepared.map((pt) => pt.module)
+  // The auth (login) router is imported under an alias to avoid clashing with a
+  // table whose own module is named "auth".
+  const authImport = authModule ? 'from .routers import auth as auth_router\n' : ''
+  const authInclude = authModule ? 'app.include_router(auth_router.router)\n' : ''
+  const imports = routerModules.map((m) => `from .routers import ${m}`).join('\n')
+  const includes =
+    authInclude + routerModules.map((m) => `app.include_router(${m}.router)`).join('\n')
 
   if (opts.async) {
     return `"""FastAPI application entry point."""
@@ -583,7 +619,7 @@ from fastapi import FastAPI
 
 from .database import Base, engine
 from . import models  # noqa: F401  (ensure models are registered)
-${imports}
+${authImport}${imports}
 
 
 @asynccontextmanager
@@ -610,7 +646,7 @@ from fastapi import FastAPI
 
 from .database import Base, engine
 from . import models  # noqa: F401  (ensure models are registered)
-${imports}
+${authImport}${imports}
 
 # Create tables on startup. For real projects use Alembic migrations instead.
 Base.metadata.create_all(bind=engine)
@@ -644,6 +680,136 @@ class Page(BaseModel, Generic[T]):
     total: int
     skip: int
     limit: int
+`
+}
+
+// ---------------------------------------------------------------------------
+// security.py  (Tier 1: password hashing)
+// ---------------------------------------------------------------------------
+
+function securityPy(): string {
+  return `"""Password hashing helpers (bcrypt via pwdlib)."""
+from pwdlib import PasswordHash
+from pwdlib.hashers.bcrypt import BcryptHasher
+
+_hasher = PasswordHash((BcryptHasher(),))
+
+
+def hash_password(password: str) -> str:
+    return _hasher.hash(password)
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    return _hasher.verify(password, hashed)
+`
+}
+
+// ---------------------------------------------------------------------------
+// auth.py + routers/auth.py  (Tier 2: JWT auth)
+// ---------------------------------------------------------------------------
+
+function authPy(authCtx: AuthContext, opts: GenOptions): string {
+  const userCls = className(authCtx.table)
+  const sess = opts.async ? 'AsyncSession' : 'Session'
+  const sessionImport = opts.async
+    ? 'from sqlalchemy.ext.asyncio import AsyncSession'
+    : 'from sqlalchemy.orm import Session'
+  const adef = opts.async ? 'async def' : 'def'
+  const aw = opts.async ? 'await ' : ''
+
+  return `"""JWT authentication: token creation and the get_current_user dependency."""
+import os
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import select
+${sessionImport}
+
+from .database import get_db
+from .models import ${userCls}
+
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
+if SECRET_KEY == "change-me-in-production" and os.getenv("ENVIRONMENT", "").lower() in {
+    "prod",
+    "production",
+}:
+    raise RuntimeError("SECRET_KEY must be set when ENVIRONMENT is production")
+
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/token")
+
+
+def create_access_token(subject: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    return jwt.encode({"sub": subject, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
+
+${adef} get_current_user(token: str = Depends(oauth2_scheme), db: ${sess} = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        subject = payload.get("sub")
+        if subject is None:
+            raise credentials_exception
+    except jwt.PyJWTError:
+        raise credentials_exception
+    user = ${aw}db.scalar(select(${userCls}).where(${userCls}.${authCtx.identity} == subject))
+    if user is None:
+        raise credentials_exception
+    return user
+`
+}
+
+function authRouterPy(authCtx: AuthContext, opts: GenOptions): string {
+  const userCls = className(authCtx.table)
+  const sess = opts.async ? 'AsyncSession' : 'Session'
+  const sessionImport = opts.async
+    ? 'from sqlalchemy.ext.asyncio import AsyncSession'
+    : 'from sqlalchemy.orm import Session'
+  const adef = opts.async ? 'async def' : 'def'
+  const aw = opts.async ? 'await ' : ''
+
+  return `"""Authentication routes: obtain a token and read the current user."""
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import select
+${sessionImport}
+
+from ..auth import create_access_token, get_current_user
+from ..database import get_db
+from ..models import ${userCls}
+from ..schemas import ${userCls}Read
+from ..security import verify_password
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/token")
+${adef} login(form_data: OAuth2PasswordRequestForm = Depends(), db: ${sess} = Depends(get_db)):
+    user = ${aw}db.scalar(
+        select(${userCls}).where(${userCls}.${authCtx.identity} == form_data.username)
+    )
+    if user is None or not verify_password(form_data.password, user.${authCtx.password}):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(form_data.username)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@router.get("/me", response_model=${userCls}Read)
+${adef} read_me(current_user=Depends(get_current_user)):
+    return current_user
 `
 }
 
@@ -753,7 +919,11 @@ def client():
 `
 }
 
-function testApiPy(prepared: PreparedTable[], opts: GenOptions): string {
+function testApiPy(
+  prepared: PreparedTable[],
+  opts: GenOptions,
+  authActive: boolean,
+): string {
   const lines: string[] = ['"""Smoke tests for the generated API."""', '', '']
   lines.push('def test_root(client):')
   lines.push('    resp = client.get("/")')
@@ -763,19 +933,34 @@ function testApiPy(prepared: PreparedTable[], opts: GenOptions): string {
     lines.push('')
     lines.push(`def test_list_${pt.routePrefix}(client):`)
     lines.push(`    resp = client.get("/${pt.routePrefix}")`)
-    lines.push('    assert resp.status_code == 200')
-    if (opts.pagination) {
+    if (authActive) {
+      // Every list endpoint requires a bearer token when auth is enabled.
+      lines.push('    assert resp.status_code == 401')
+    } else if (opts.pagination) {
+      lines.push('    assert resp.status_code == 200')
       lines.push('    body = resp.json()')
       lines.push('    assert "items" in body and "total" in body')
     } else {
+      lines.push('    assert resp.status_code == 200')
       lines.push('    assert isinstance(resp.json(), list)')
     }
     lines.push('')
     lines.push('')
     lines.push(`def test_get_missing_${pt.varName}(client):`)
     lines.push(`    resp = client.get("/${pt.routePrefix}/999999")`)
-    // String PKs would 422 rather than 404 for a numeric-looking id; both are fine.
-    lines.push('    assert resp.status_code in (404, 422)')
+    if (authActive) {
+      lines.push('    assert resp.status_code == 401')
+    } else {
+      // String PKs would 422 rather than 404 for a numeric-looking id.
+      lines.push('    assert resp.status_code in (404, 422)')
+    }
+    lines.push('')
+  }
+  if (authActive) {
+    lines.push('')
+    lines.push('def test_login_requires_credentials(client):')
+    lines.push('    resp = client.post("/auth/token", data={})')
+    lines.push('    assert resp.status_code == 422')
     lines.push('')
   }
   return lines.join('\n').replace(/\n+$/, '\n')

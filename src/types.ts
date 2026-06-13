@@ -54,6 +54,10 @@ export interface GenOptions {
   docker: boolean
   /** Emit a pytest smoke-test suite. */
   tests: boolean
+  /** Hash password-like columns on create/update via app/security.py. */
+  hashPasswords: boolean
+  /** Generate JWT auth (login + get_current_user) when a users table exists. */
+  auth: boolean
 }
 
 export const DEFAULT_OPTIONS: GenOptions = {
@@ -62,6 +66,8 @@ export const DEFAULT_OPTIONS: GenOptions = {
   pagination: false,
   docker: false,
   tests: false,
+  hashPasswords: false,
+  auth: false,
 }
 
 export interface ParseResult {
