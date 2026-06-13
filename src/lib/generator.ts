@@ -108,7 +108,7 @@ export function generateProject(
     })
   }
 
-  files.push({ path: 'README.md', content: readmeMd(prepared), language: 'markdown' })
+  files.push({ path: 'README.md', content: readmeMd(prepared, authCtx, hashing), language: 'markdown' })
 
   return files
 }
@@ -974,7 +974,11 @@ function testApiPy(
 // README.md
 // ---------------------------------------------------------------------------
 
-function readmeMd(prepared: PreparedTable[]): string {
+function readmeMd(
+  prepared: PreparedTable[],
+  authCtx: AuthContext | null,
+  hashing: boolean,
+): string {
   const endpoints = prepared
     .map((pt) => {
       const pk = pt.pk ? pt.pk.name : 'id'
@@ -989,6 +993,12 @@ function readmeMd(prepared: PreparedTable[]): string {
 | DELETE | \`/${pt.routePrefix}/{${pk}}\` | Delete |`
     })
     .join('\n\n')
+
+  const authSection = authCtx ? '\n\n' + authDocs(authCtx) : ''
+  const layoutExtra = [
+    hashing ? '  security.py     # password hashing (bcrypt)\n' : '',
+    authCtx ? '  auth.py         # JWT tokens + get_current_user\n' : '',
+  ].join('')
 
   return `# Generated FastAPI REST API
 
@@ -1010,7 +1020,7 @@ By default it uses a local SQLite database (\`app.db\`). Set \`DATABASE_URL\`
 
 ## Endpoints
 
-${endpoints}
+${endpoints}${authSection}
 
 ## Layout
 
@@ -1019,11 +1029,68 @@ app/
   database.py     # engine, session, Base, get_db dependency
   models.py       # SQLAlchemy ORM models
   schemas.py      # Pydantic request/response models
-  routers/        # one CRUD router per table
+${layoutExtra}  routers/        # one CRUD router per table
   main.py         # FastAPI app wiring
 requirements.txt
 \`\`\`
 `
+}
+
+function authDocs(authCtx: AuthContext): string {
+  const route = snake(authCtx.table)
+  const id = authCtx.identity
+  const pw = authCtx.password
+  return `## Authentication
+
+This API uses the **OAuth2 password flow with JWT bearer tokens**, driven by the
+\`${authCtx.table}\` table. Every endpoint requires a token **except** user
+registration (\`POST /${route}\`) and login (\`POST /auth/token\`).
+
+### 1. Register a user
+
+Registration is open so the first account can be created. Send the plaintext
+password in the \`${pw}\` field — it is hashed (bcrypt) before storage and is
+never returned in any response.
+
+\`\`\`bash
+curl -X POST http://127.0.0.1:8000/${route} \\
+  -H "Content-Type: application/json" \\
+  -d '{"${id}": "user@example.com", "${pw}": "s3cret-password"}'
+\`\`\`
+
+### 2. Log in to get a token
+
+\`POST /auth/token\` expects **form-encoded** credentials (the OAuth2 standard).
+The form's \`username\` field is your **\`${id}\`** value.
+
+\`\`\`bash
+curl -X POST http://127.0.0.1:8000/auth/token \\
+  -d "username=user@example.com&password=s3cret-password"
+# -> {"access_token": "eyJhbGci...", "token_type": "bearer"}
+\`\`\`
+
+### 3. Call protected endpoints
+
+Send the token in the \`Authorization\` header:
+
+\`\`\`bash
+TOKEN="eyJhbGci..."
+curl http://127.0.0.1:8000/${route} -H "Authorization: Bearer $TOKEN"
+\`\`\`
+
+\`GET /auth/me\` returns the currently authenticated user. In the interactive
+docs (\`/docs\`), click **Authorize** and enter the \`${id}\` + password to try
+protected routes from the browser.
+
+### Configuration
+
+| Env var | Purpose | Default |
+| ------- | ------- | ------- |
+| \`SECRET_KEY\` | Signs the JWTs — generate with \`openssl rand -hex 32\` | placeholder (app refuses to boot when \`ENVIRONMENT=production\`) |
+| \`ACCESS_TOKEN_EXPIRE_MINUTES\` | Token lifetime | \`30\` |
+
+> **Scaffolding, not a security audit.** Review token expiry, password policy,
+> rate limiting, and HTTPS before relying on this in production.`
 }
 
 // ---------------------------------------------------------------------------
