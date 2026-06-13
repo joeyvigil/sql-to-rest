@@ -5,6 +5,8 @@ FastAPI** REST application. Paste your schema (tables, columns, primary keys and
 foreign-key relationships) and get back SQLAlchemy models, Pydantic schemas, and
 per-table CRUD routers — downloadable as a `.zip`.
 
+**🔗 Live demo: https://joeyvigil.github.io/sql-to-rest/**
+
 ## Features
 
 - Pragmatic `CREATE TABLE` parser (MySQL / PostgreSQL / SQLite dialects)
