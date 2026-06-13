@@ -14,11 +14,21 @@ per-table CRUD routers — downloadable as a `.zip`.
 - Pragmatic `CREATE TABLE` parser (MySQL / PostgreSQL / SQLite dialects)
 - Detects primary keys, `NOT NULL`, `UNIQUE`, defaults, `AUTO_INCREMENT`/`SERIAL`
 - Inline and table-level `FOREIGN KEY ... REFERENCES` → SQLAlchemy relationships
+- **Generation options** — target SQLite / PostgreSQL / MySQL, and choose
+  **sync or async** SQLAlchemy (the right driver, engine, session, and route
+  handlers are emitted for each combination)
+- **ER diagram** view that visualizes the parsed tables and their relationships
+- **Syntax highlighting** — a CodeMirror SQL editor for input and highlighted
+  Python output
 - Generates a complete FastAPI project:
   - `app/database.py`, `app/models.py`, `app/schemas.py`
   - one CRUD router per table (`list / get / create / update / delete`)
   - `app/main.py`, `requirements.txt`, `.env.example`, `README.md`
 - Live preview with file tree, copy-to-clipboard, and zip download
+
+### ER diagram
+
+![ER diagram view](docs/diagram.png)
 
 ## Develop
 

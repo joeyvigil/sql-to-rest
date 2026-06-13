@@ -4,20 +4,27 @@ import { parseSql } from './lib/sqlParser'
 import { generateProject } from './lib/generator'
 import { SAMPLE_SQL } from './lib/sample'
 import { copyToClipboard, downloadZip } from './lib/download'
-import type { GeneratedFile } from './types'
+import { DEFAULT_OPTIONS, type GenOptions, type GeneratedFile } from './types'
 import { FileTree } from './components/FileTree'
 import { CodeView } from './components/CodeView'
 import { SchemaSummary } from './components/SchemaSummary'
+import { ErDiagram } from './components/ErDiagram'
+import { OptionsPanel } from './components/OptionsPanel'
+import { SqlEditor } from './components/SqlEditor'
+
+type SchemaView = 'tables' | 'diagram'
 
 export default function App() {
   const [sql, setSql] = useState(SAMPLE_SQL)
+  const [options, setOptions] = useState<GenOptions>(DEFAULT_OPTIONS)
   const [selected, setSelected] = useState<string | null>(null)
+  const [schemaView, setSchemaView] = useState<SchemaView>('tables')
   const [copied, setCopied] = useState(false)
 
   const { schema, warnings, files, error } = useMemo(() => {
     try {
       const { schema, warnings } = parseSql(sql)
-      const files = schema.tables.length ? generateProject(schema) : []
+      const files = schema.tables.length ? generateProject(schema, options) : []
       return { schema, warnings, files, error: null as string | null }
     } catch (e) {
       return {
@@ -27,7 +34,7 @@ export default function App() {
         error: e instanceof Error ? e.message : String(e),
       }
     }
-  }, [sql])
+  }, [sql, options])
 
   const activePath =
     selected && files.some((f) => f.path === selected)
@@ -77,20 +84,41 @@ export default function App() {
               {schema.tables.length} table{schema.tables.length === 1 ? '' : 's'}
             </span>
           </div>
-          <textarea
-            className="mono sql-input"
-            spellCheck={false}
-            value={sql}
-            onChange={(e) => setSql(e.target.value)}
-            placeholder="CREATE TABLE users (&#10;  id INTEGER PRIMARY KEY,&#10;  email VARCHAR(255) NOT NULL UNIQUE&#10;);"
-          />
+          <SqlEditor value={sql} onChange={setSql} />
           {error && <div className="banner error">Parser error: {error}</div>}
           {warnings.map((w, i) => (
             <div className="banner warn" key={i}>
               ⚠ {w}
             </div>
           ))}
-          <SchemaSummary schema={schema} />
+          {schema.tables.length > 0 && (
+            <div className="schema-section">
+              <div className="schema-toolbar">
+                <span className="schema-title">Detected schema</span>
+                <div className="segmented">
+                  <button
+                    className={schemaView === 'tables' ? 'seg active' : 'seg'}
+                    onClick={() => setSchemaView('tables')}
+                  >
+                    Tables
+                  </button>
+                  <button
+                    className={schemaView === 'diagram' ? 'seg active' : 'seg'}
+                    onClick={() => setSchemaView('diagram')}
+                  >
+                    Diagram
+                  </button>
+                </div>
+              </div>
+              <div className="schema-content">
+                {schemaView === 'tables' ? (
+                  <SchemaSummary schema={schema} />
+                ) : (
+                  <ErDiagram schema={schema} />
+                )}
+              </div>
+            </div>
+          )}
         </section>
 
         <section className="pane output-pane">
@@ -102,6 +130,7 @@ export default function App() {
               </button>
             )}
           </div>
+          <OptionsPanel options={options} onChange={setOptions} />
           {files.length ? (
             <div className="output-body">
               <FileTree

@@ -41,6 +41,20 @@ export interface GeneratedFile {
   language: 'python' | 'text' | 'markdown'
 }
 
+export type DbTarget = 'sqlite' | 'postgres' | 'mysql'
+
+export interface GenOptions {
+  /** Target database dialect; affects the connection URL and driver. */
+  db: DbTarget
+  /** Generate async SQLAlchemy + async route handlers when true. */
+  async: boolean
+}
+
+export const DEFAULT_OPTIONS: GenOptions = {
+  db: 'sqlite',
+  async: false,
+}
+
 export interface ParseResult {
   schema: Schema
   warnings: string[]

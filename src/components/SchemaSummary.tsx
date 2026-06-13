@@ -8,7 +8,6 @@ export function SchemaSummary({ schema }: Props) {
   if (!schema.tables.length) return null
   return (
     <div className="schema-summary">
-      <h3>Detected schema</h3>
       {schema.tables.map((t) => (
         <div className="table-card" key={t.name}>
           <div className="table-name">{t.name}</div>

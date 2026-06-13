@@ -1,4 +1,12 @@
-import type { Column, GeneratedFile, Schema, Table } from '../types'
+import type {
+  Column,
+  DbTarget,
+  GeneratedFile,
+  GenOptions,
+  Schema,
+  Table,
+} from '../types'
+import { DEFAULT_OPTIONS } from '../types'
 import { className, pluralize, singularVar, snake } from './naming'
 
 interface PreparedTable {
@@ -10,7 +18,10 @@ interface PreparedTable {
   pk: Column | null
 }
 
-export function generateProject(schema: Schema): GeneratedFile[] {
+export function generateProject(
+  schema: Schema,
+  options: GenOptions = DEFAULT_OPTIONS,
+): GeneratedFile[] {
   const prepared: PreparedTable[] = schema.tables.map((table) => {
     const module = snake(table.name)
     return {
@@ -26,10 +37,10 @@ export function generateProject(schema: Schema): GeneratedFile[] {
 
   const files: GeneratedFile[] = []
 
-  files.push({ path: 'requirements.txt', content: requirements(), language: 'text' })
-  files.push({ path: '.env.example', content: envExample(), language: 'text' })
+  files.push({ path: 'requirements.txt', content: requirements(options), language: 'text' })
+  files.push({ path: '.env.example', content: envExample(options), language: 'text' })
   files.push({ path: 'app/__init__.py', content: '', language: 'python' })
-  files.push({ path: 'app/database.py', content: databasePy(), language: 'python' })
+  files.push({ path: 'app/database.py', content: databasePy(options), language: 'python' })
   files.push({ path: 'app/models.py', content: modelsPy(prepared), language: 'python' })
   files.push({ path: 'app/schemas.py', content: schemasPy(prepared), language: 'python' })
   files.push({
@@ -40,11 +51,11 @@ export function generateProject(schema: Schema): GeneratedFile[] {
   for (const pt of prepared) {
     files.push({
       path: `app/routers/${pt.module}.py`,
-      content: routerPy(pt),
+      content: routerPy(pt, options),
       language: 'python',
     })
   }
-  files.push({ path: 'app/main.py', content: mainPy(prepared), language: 'python' })
+  files.push({ path: 'app/main.py', content: mainPy(prepared, options), language: 'python' })
   files.push({ path: 'README.md', content: readmeMd(prepared), language: 'markdown' })
 
   return files
@@ -54,25 +65,61 @@ export function generateProject(schema: Schema): GeneratedFile[] {
 // Static-ish files
 // ---------------------------------------------------------------------------
 
-function requirements(): string {
-  return [
+/** Per-dialect driver package + default connection URL. */
+function dbConfig(opts: GenOptions): { driver: string | null; url: string } {
+  const table: Record<
+    DbTarget,
+    { sync: [string | null, string]; async: [string | null, string] }
+  > = {
+    sqlite: {
+      sync: [null, 'sqlite:///./app.db'],
+      async: ['aiosqlite>=0.19', 'sqlite+aiosqlite:///./app.db'],
+    },
+    postgres: {
+      sync: [
+        'psycopg[binary]>=3.1',
+        'postgresql+psycopg://postgres:postgres@localhost:5432/app',
+      ],
+      async: [
+        'asyncpg>=0.29',
+        'postgresql+asyncpg://postgres:postgres@localhost:5432/app',
+      ],
+    },
+    mysql: {
+      sync: ['pymysql>=1.1', 'mysql+pymysql://root:root@localhost:3306/app'],
+      async: ['aiomysql>=0.2', 'mysql+aiomysql://root:root@localhost:3306/app'],
+    },
+  }
+  const [driver, url] = opts.async ? table[opts.db].async : table[opts.db].sync
+  return { driver, url }
+}
+
+function requirements(opts: GenOptions): string {
+  const lines = [
     'fastapi>=0.110',
     'uvicorn[standard]>=0.29',
     'sqlalchemy>=2.0',
     'pydantic>=2.6',
     'pydantic-settings>=2.2',
     'python-dotenv>=1.0',
-    '',
-  ].join('\n')
+  ]
+  const { driver } = dbConfig(opts)
+  if (driver) lines.push(driver)
+  lines.push('')
+  return lines.join('\n')
 }
 
-function envExample(): string {
-  return ['# Override the default SQLite database here.', 'DATABASE_URL=sqlite:///./app.db', ''].join(
-    '\n',
-  )
+function envExample(opts: GenOptions): string {
+  const { url } = dbConfig(opts)
+  return [`# Override the default ${opts.db} connection here.`, `DATABASE_URL=${url}`, ''].join('\n')
 }
 
-function databasePy(): string {
+function databasePy(opts: GenOptions): string {
+  const { url } = dbConfig(opts)
+  return opts.async ? databaseAsyncPy(url) : databaseSyncPy(url)
+}
+
+function databaseSyncPy(url: string): string {
   return `"""Database engine, session factory and declarative base."""
 import os
 
@@ -80,13 +127,17 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "${url}")
 
 # check_same_thread is only needed for SQLite.
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
 engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+class Base(DeclarativeBase):
+    pass
 
 
 if DATABASE_URL.startswith("sqlite"):
@@ -98,10 +149,6 @@ if DATABASE_URL.startswith("sqlite"):
         cursor.close()
 
 
-class Base(DeclarativeBase):
-    pass
-
-
 def get_db():
     """FastAPI dependency that yields a scoped session."""
     db = SessionLocal()
@@ -109,6 +156,43 @@ def get_db():
         yield db
     finally:
         db.close()
+`
+}
+
+function databaseAsyncPy(url: string): string {
+  return `"""Async database engine, session factory and declarative base."""
+import os
+
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+
+DATABASE_URL = os.getenv("DATABASE_URL", "${url}")
+
+connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+
+engine = create_async_engine(DATABASE_URL, connect_args=connect_args)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+if "sqlite" in DATABASE_URL:
+    # SQLite ignores foreign keys (and ON DELETE) unless explicitly enabled.
+    @event.listens_for(Engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
+async def get_db():
+    """FastAPI dependency that yields an async session."""
+    async with SessionLocal() as session:
+        yield session
 `
 }
 
@@ -309,12 +393,73 @@ function collectPyTypeImports(pyType: string, into: Set<string>): void {
 // routers/<table>.py
 // ---------------------------------------------------------------------------
 
-function routerPy(pt: PreparedTable): string {
+function routerPy(pt: PreparedTable, opts: GenOptions): string {
   const pk = pt.pk
   const pkName = pk ? pk.name : 'id'
   const pkType = pk ? pk.pyType : 'int'
   const cls = pt.cls
   const v = pt.varName
+
+  if (opts.async) {
+    return `"""CRUD endpoints for ${pt.table.name}."""
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import get_db
+from ..models import ${cls}
+from ..schemas import ${cls}Create, ${cls}Read, ${cls}Update
+
+router = APIRouter(prefix="/${pt.routePrefix}", tags=["${pt.routePrefix}"])
+
+
+@router.get("", response_model=List[${cls}Read])
+async def list_${pt.routePrefix}(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
+    result = await db.scalars(select(${cls}).offset(skip).limit(limit))
+    return result.all()
+
+
+@router.get("/{${pkName}}", response_model=${cls}Read)
+async def get_${v}(${pkName}: ${pkType}, db: AsyncSession = Depends(get_db)):
+    obj = await db.get(${cls}, ${pkName})
+    if obj is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
+    return obj
+
+
+@router.post("", response_model=${cls}Read, status_code=status.HTTP_201_CREATED)
+async def create_${v}(payload: ${cls}Create, db: AsyncSession = Depends(get_db)):
+    obj = ${cls}(**payload.model_dump(exclude_unset=True))
+    db.add(obj)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+@router.put("/{${pkName}}", response_model=${cls}Read)
+async def update_${v}(${pkName}: ${pkType}, payload: ${cls}Update, db: AsyncSession = Depends(get_db)):
+    obj = await db.get(${cls}, ${pkName})
+    if obj is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(obj, field, value)
+    await db.commit()
+    await db.refresh(obj)
+    return obj
+
+
+@router.delete("/{${pkName}}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_${v}(${pkName}: ${pkType}, db: AsyncSession = Depends(get_db)):
+    obj = await db.get(${cls}, ${pkName})
+    if obj is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="${cls} not found")
+    await db.delete(obj)
+    await db.commit()
+    return None
+`
+  }
 
   return `"""CRUD endpoints for ${pt.table.name}."""
 from typing import List
@@ -379,13 +524,43 @@ def delete_${v}(${pkName}: ${pkType}, db: Session = Depends(get_db)):
 // main.py
 // ---------------------------------------------------------------------------
 
-function mainPy(prepared: PreparedTable[]): string {
+function mainPy(prepared: PreparedTable[], opts: GenOptions): string {
   const imports = prepared
     .map((pt) => `from .routers import ${pt.module}`)
     .join('\n')
   const includes = prepared
     .map((pt) => `app.include_router(${pt.module}.router)`)
     .join('\n')
+
+  if (opts.async) {
+    return `"""FastAPI application entry point."""
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from .database import Base, engine
+from . import models  # noqa: F401  (ensure models are registered)
+${imports}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create tables on startup. For real projects use Alembic migrations instead.
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+
+app = FastAPI(title="Generated REST API", version="1.0.0", lifespan=lifespan)
+
+${includes}
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "docs": "/docs"}
+`
+  }
 
   return `"""FastAPI application entry point."""
 from fastapi import FastAPI
