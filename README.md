@@ -17,6 +17,12 @@ per-table CRUD routers — downloadable as a `.zip`.
 - **Generation options** — target SQLite / PostgreSQL / MySQL, and choose
   **sync or async** SQLAlchemy (the right driver, engine, session, and route
   handlers are emitted for each combination)
+- **Pagination** (optional) — list endpoints return a `{ items, total, skip,
+  limit }` envelope via a generic `Page[T]`
+- **Docker** (optional) — `Dockerfile`, `.dockerignore`, and a
+  `docker-compose.yml` that adds a Postgres/MySQL service when relevant
+- **pytest suite** (optional) — generated smoke tests that run against a
+  throwaway SQLite database
 - **ER diagram** view that visualizes the parsed tables and their relationships
 - **Syntax highlighting** — a CodeMirror SQL editor for input and highlighted
   Python output

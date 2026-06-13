@@ -48,11 +48,20 @@ export interface GenOptions {
   db: DbTarget
   /** Generate async SQLAlchemy + async route handlers when true. */
   async: boolean
+  /** Return paginated list responses ({ items, total, skip, limit }). */
+  pagination: boolean
+  /** Emit a Dockerfile, .dockerignore and docker-compose.yml. */
+  docker: boolean
+  /** Emit a pytest smoke-test suite. */
+  tests: boolean
 }
 
 export const DEFAULT_OPTIONS: GenOptions = {
   db: 'sqlite',
   async: false,
+  pagination: false,
+  docker: false,
+  tests: false,
 }
 
 export interface ParseResult {

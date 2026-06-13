@@ -46,6 +46,46 @@ export function OptionsPanel({ options, onChange }: Props) {
           </button>
         </div>
       </div>
+
+      <div className="option-group toggles">
+        <Toggle
+          label="Pagination"
+          checked={options.pagination}
+          onChange={(v) => onChange({ ...options, pagination: v })}
+        />
+        <Toggle
+          label="Docker"
+          checked={options.docker}
+          onChange={(v) => onChange({ ...options, docker: v })}
+        />
+        <Toggle
+          label="Tests"
+          checked={options.tests}
+          onChange={(v) => onChange({ ...options, tests: v })}
+        />
+      </div>
     </div>
+  )
+}
+
+function Toggle({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string
+  checked: boolean
+  onChange: (v: boolean) => void
+}) {
+  return (
+    <label className={checked ? 'toggle on' : 'toggle'}>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      <span className="toggle-dot" />
+      {label}
+    </label>
   )
 }

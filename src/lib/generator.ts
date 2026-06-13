@@ -43,6 +43,9 @@ export function generateProject(
   files.push({ path: 'app/database.py', content: databasePy(options), language: 'python' })
   files.push({ path: 'app/models.py', content: modelsPy(prepared), language: 'python' })
   files.push({ path: 'app/schemas.py', content: schemasPy(prepared), language: 'python' })
+  if (options.pagination) {
+    files.push({ path: 'app/pagination.py', content: paginationPy(), language: 'python' })
+  }
   files.push({
     path: 'app/routers/__init__.py',
     content: '',
@@ -56,6 +59,26 @@ export function generateProject(
     })
   }
   files.push({ path: 'app/main.py', content: mainPy(prepared, options), language: 'python' })
+
+  if (options.docker) {
+    files.push({ path: 'Dockerfile', content: dockerfile(), language: 'text' })
+    files.push({ path: '.dockerignore', content: dockerignore(), language: 'text' })
+    files.push({
+      path: 'docker-compose.yml',
+      content: dockerCompose(options),
+      language: 'text',
+    })
+  }
+  if (options.tests) {
+    files.push({ path: 'tests/__init__.py', content: '', language: 'python' })
+    files.push({ path: 'tests/conftest.py', content: conftestPy(options), language: 'python' })
+    files.push({
+      path: 'tests/test_api.py',
+      content: testApiPy(prepared, options),
+      language: 'python',
+    })
+  }
+
   files.push({ path: 'README.md', content: readmeMd(prepared), language: 'markdown' })
 
   return files
@@ -105,6 +128,12 @@ function requirements(opts: GenOptions): string {
   ]
   const { driver } = dbConfig(opts)
   if (driver) lines.push(driver)
+  if (opts.tests) {
+    // The generated tests run against a throwaway SQLite database.
+    lines.push('pytest>=8.0')
+    lines.push('httpx>=0.27')
+    if (opts.async) lines.push('aiosqlite>=0.19')
+  }
   lines.push('')
   return lines.join('\n')
 }
@@ -400,25 +429,35 @@ function routerPy(pt: PreparedTable, opts: GenOptions): string {
   const cls = pt.cls
   const v = pt.varName
 
-  if (opts.async) {
-    return `"""CRUD endpoints for ${pt.table.name}."""
-from typing import List
+  const selectImport = opts.pagination
+    ? 'from sqlalchemy import func, select'
+    : 'from sqlalchemy import select'
+  const pageImport = opts.pagination ? `\nfrom ..pagination import Page` : ''
+  const listModel = opts.pagination ? `Page[${cls}Read]` : `List[${cls}Read]`
+  const typingBlock = opts.pagination ? '' : 'from typing import List\n\n'
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+  if (opts.async) {
+    const listBody = opts.pagination
+      ? `    total = await db.scalar(select(func.count()).select_from(${cls}))
+    result = await db.scalars(select(${cls}).offset(skip).limit(limit))
+    return Page(items=list(result.all()), total=total or 0, skip=skip, limit=limit)`
+      : `    result = await db.scalars(select(${cls}).offset(skip).limit(limit))
+    return result.all()`
+    return `"""CRUD endpoints for ${pt.table.name}."""
+${typingBlock}from fastapi import APIRouter, Depends, HTTPException, status
+${selectImport}
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
 from ..models import ${cls}
-from ..schemas import ${cls}Create, ${cls}Read, ${cls}Update
+from ..schemas import ${cls}Create, ${cls}Read, ${cls}Update${pageImport}
 
 router = APIRouter(prefix="/${pt.routePrefix}", tags=["${pt.routePrefix}"])
 
 
-@router.get("", response_model=List[${cls}Read])
+@router.get("", response_model=${listModel})
 async def list_${pt.routePrefix}(skip: int = 0, limit: int = 100, db: AsyncSession = Depends(get_db)):
-    result = await db.scalars(select(${cls}).offset(skip).limit(limit))
-    return result.all()
+${listBody}
 
 
 @router.get("/{${pkName}}", response_model=${cls}Read)
@@ -461,23 +500,27 @@ async def delete_${v}(${pkName}: ${pkType}, db: AsyncSession = Depends(get_db)):
 `
   }
 
-  return `"""CRUD endpoints for ${pt.table.name}."""
-from typing import List
+  const listBody = opts.pagination
+    ? `    total = db.scalar(select(func.count()).select_from(${cls}))
+    items = db.scalars(select(${cls}).offset(skip).limit(limit)).all()
+    return Page(items=list(items), total=total or 0, skip=skip, limit=limit)`
+    : `    return db.scalars(select(${cls}).offset(skip).limit(limit)).all()`
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+  return `"""CRUD endpoints for ${pt.table.name}."""
+${typingBlock}from fastapi import APIRouter, Depends, HTTPException, status
+${selectImport}
 from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..models import ${cls}
-from ..schemas import ${cls}Create, ${cls}Read, ${cls}Update
+from ..schemas import ${cls}Create, ${cls}Read, ${cls}Update${pageImport}
 
 router = APIRouter(prefix="/${pt.routePrefix}", tags=["${pt.routePrefix}"])
 
 
-@router.get("", response_model=List[${cls}Read])
+@router.get("", response_model=${listModel})
 def list_${pt.routePrefix}(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    return db.scalars(select(${cls}).offset(skip).limit(limit)).all()
+${listBody}
 
 
 @router.get("/{${pkName}}", response_model=${cls}Read)
@@ -581,6 +624,161 @@ ${includes}
 def root():
     return {"status": "ok", "docs": "/docs"}
 `
+}
+
+// ---------------------------------------------------------------------------
+// pagination.py
+// ---------------------------------------------------------------------------
+
+function paginationPy(): string {
+  return `"""Generic pagination envelope for list endpoints."""
+from typing import Generic, List, TypeVar
+
+from pydantic import BaseModel
+
+T = TypeVar("T")
+
+
+class Page(BaseModel, Generic[T]):
+    items: List[T]
+    total: int
+    skip: int
+    limit: int
+`
+}
+
+// ---------------------------------------------------------------------------
+// Docker
+// ---------------------------------------------------------------------------
+
+function dockerfile(): string {
+  return `FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+`
+}
+
+function dockerignore(): string {
+  return ['__pycache__/', '*.pyc', '.venv/', 'venv/', '*.db', '.env', '.git/', ''].join('\n')
+}
+
+function dockerCompose(opts: GenOptions): string {
+  const composeUrl = dbConfig(opts).url.replace('@localhost', '@db')
+  const api = `  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: ${composeUrl}`
+
+  if (opts.db === 'postgres') {
+    return `services:
+${api}
+    depends_on:
+      - db
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+`
+  }
+  if (opts.db === 'mysql') {
+    return `services:
+${api}
+    depends_on:
+      - db
+  db:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: app
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysqldata:/var/lib/mysql
+
+volumes:
+  mysqldata:
+`
+  }
+  // SQLite: single service, no database container needed.
+  return `services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+`
+}
+
+// ---------------------------------------------------------------------------
+// tests/
+// ---------------------------------------------------------------------------
+
+function conftestPy(opts: GenOptions): string {
+  const url = opts.async ? 'sqlite+aiosqlite:///./test_app.db' : 'sqlite:///./test_app.db'
+  return `"""Pytest fixtures. Tests run against a throwaway SQLite database."""
+import os
+
+# Point the app at a disposable SQLite DB before it is imported.
+os.environ["DATABASE_URL"] = "${url}"
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app.main import app  # noqa: E402
+
+
+@pytest.fixture()
+def client():
+    # The context manager runs startup/shutdown (creates tables).
+    with TestClient(app) as c:
+        yield c
+`
+}
+
+function testApiPy(prepared: PreparedTable[], opts: GenOptions): string {
+  const lines: string[] = ['"""Smoke tests for the generated API."""', '', '']
+  lines.push('def test_root(client):')
+  lines.push('    resp = client.get("/")')
+  lines.push('    assert resp.status_code == 200')
+  lines.push('')
+  for (const pt of prepared) {
+    lines.push('')
+    lines.push(`def test_list_${pt.routePrefix}(client):`)
+    lines.push(`    resp = client.get("/${pt.routePrefix}")`)
+    lines.push('    assert resp.status_code == 200')
+    if (opts.pagination) {
+      lines.push('    body = resp.json()')
+      lines.push('    assert "items" in body and "total" in body')
+    } else {
+      lines.push('    assert isinstance(resp.json(), list)')
+    }
+    lines.push('')
+    lines.push('')
+    lines.push(`def test_get_missing_${pt.varName}(client):`)
+    lines.push(`    resp = client.get("/${pt.routePrefix}/999999")`)
+    // String PKs would 422 rather than 404 for a numeric-looking id; both are fine.
+    lines.push('    assert resp.status_code in (404, 422)')
+    lines.push('')
+  }
+  return lines.join('\n').replace(/\n+$/, '\n')
 }
 
 // ---------------------------------------------------------------------------
